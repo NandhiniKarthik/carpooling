@@ -1,0 +1,6 @@
+streamlit==1.54.0
+pandas==2.3.3
+googlemaps==4.10.0
+folium==0.20.0
+streamlit-folium==0.26.2
+streamlit-searchbox==0.1.24

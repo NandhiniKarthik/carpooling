@@ -2,12 +2,15 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import io
 from datetime import datetime, date, time
 from pathlib import Path
 import googlemaps
 import folium
 from streamlit_folium import st_folium
 from streamlit_searchbox import st_searchbox
+import qrcode
+from PIL import Image
 
 # ── Data persistence ──────────────────────────────────────────────────────────
 DATA_FILE = Path(__file__).parent / "data.json"
@@ -16,11 +19,27 @@ def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
             return json.load(f)
-    return {"rides": [], "bookings": [], "insurance": {}, "passenger_ids": {}, "medical_info": {}}
+    return {"rides": [], "bookings": [], "insurance": {}, "passenger_ids": {}, "medical_info": {}, "parking_bookings": [], "vehicles": []}
 
 def save_data(data: dict):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+# ── QR Code helpers ───────────────────────────────────────────────────────────
+def make_qr_bytes(payload: dict) -> bytes:
+    """Generate a QR code PNG from a dict and return raw bytes."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=3,
+    )
+    qr.add_data(json.dumps(payload, default=str))
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#1a1a2e", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 # ── Google Maps helpers ────────────────────────────────────────────────────────
 @st.cache_resource
@@ -195,7 +214,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Navigation")
-    pages = ["🏠 Home", "🔍 Find a Ride", "➕ Offer a Ride", "📋 My Bookings", "📊 Dashboard", "👤 My Profile"]
+    pages = ["🏠 Home", "🔍 Find a Ride", "➕ Offer a Ride", "📋 My Bookings", "📊 Dashboard", "👤 My Profile", "🅿️ Villa Parking"]
     for p in pages:
         if st.button(p, use_container_width=True):
             st.session_state.page = p.split(" ", 1)[1]
@@ -972,4 +991,330 @@ elif page == "Dashboard":
                     "Available": ride["seats"] - booked,
                     "£/Seat":   ride["price_per_seat"],
                 })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+# ── VILLA PARKING ─────────────────────────────────────────────────────────────
+elif page == "Villa Parking":
+    st.title("🅿️ Villa Society Parking")
+    st.markdown("**5 reserved slots · QR-linked vehicle passes · instant booking**")
+
+    TOTAL_SLOTS = 5
+    SLOT_NAMES  = [f"P{i}" for i in range(1, TOTAL_SLOTS + 1)]
+    user        = st.session_state.current_user
+
+    if "parking_bookings" not in data:
+        data["parking_bookings"] = []
+    if "vehicles" not in data:
+        data["vehicles"] = []
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def slots_overlap(s1, e1, s2, e2):
+        return s1 < e2 and s2 < e1
+
+    def get_occupied_slots(date_str, start_str, end_str):
+        occupied = set()
+        for pb in data["parking_bookings"]:
+            if pb["date"] == date_str and slots_overlap(start_str, end_str, pb["start_time"], pb["end_time"]):
+                occupied.add(pb["slot"])
+        return occupied
+
+    def my_vehicles():
+        return [v for v in data["vehicles"] if v["owner"] == user]
+
+    # ── tabs ──────────────────────────────────────────────────────────────────
+    tab_cars, tab_book, tab_mine, tab_all = st.tabs(
+        ["🚗 My Cars & QR", "🅿️ Book a Slot", "📋 My Parking", "📊 All Bookings"]
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 1 — My Cars & QR Codes
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_cars:
+        st.subheader("Register your vehicle & get a QR pass")
+
+        if user == "Guest":
+            st.warning("Enter your name in the sidebar to manage vehicles.")
+        else:
+            # ── Register form ─────────────────────────────────────────────
+            with st.expander("➕ Register a new vehicle", expanded=len(my_vehicles()) == 0):
+                with st.form("register_vehicle_form"):
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        v_owner_name = st.text_input("Owner full name", placeholder="Alice Johnson")
+                        v_number     = st.text_input("Vehicle number *", placeholder="AB12 CDE")
+                        v_model      = st.text_input("Car model", placeholder="Toyota Prius")
+                    with col_b:
+                        v_color   = st.text_input("Color", placeholder="White")
+                        v_phone   = st.text_input("Contact phone", placeholder="07700 900123")
+                        v_flat    = st.text_input("Flat / unit no.", placeholder="Villa 4B")
+                    reg_submit = st.form_submit_button("Register & Generate QR", type="primary", use_container_width=True)
+
+                    if reg_submit:
+                        if not v_number.strip():
+                            st.error("Vehicle number is required.")
+                        elif any(v["vehicle_number"] == v_number.strip().upper() and v["owner"] == user
+                                 for v in data["vehicles"]):
+                            st.warning("This vehicle is already registered under your name.")
+                        else:
+                            vid = f"VH{len(data['vehicles']) + 1:04d}"
+                            data["vehicles"].append({
+                                "id":             vid,
+                                "owner":          user,
+                                "owner_name":     v_owner_name.strip() or user,
+                                "vehicle_number": v_number.strip().upper(),
+                                "model":          v_model.strip(),
+                                "color":          v_color.strip(),
+                                "phone":          v_phone.strip(),
+                                "flat":           v_flat.strip(),
+                                "registered_at":  str(datetime.now()),
+                                "society":        "Villa Society",
+                            })
+                            save_data(data)
+                            st.success(f"Vehicle **{v_number.strip().upper()}** registered! Your QR pass is below.")
+                            st.rerun()
+
+            # ── Registered vehicles & QR codes ────────────────────────────
+            vehicles = my_vehicles()
+            if not vehicles:
+                st.info("No vehicles registered yet. Use the form above.")
+            else:
+                st.markdown(f"**{len(vehicles)} vehicle(s) registered**")
+                for v in vehicles:
+                    with st.expander(f"🚗 {v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ·  {v.get('color','') or ''}"):
+                        c1, c2 = st.columns([1, 2])
+                        with c1:
+                            # Build QR payload
+                            qr_payload = {
+                                "type":           "vehicle_pass",
+                                "vehicle_id":     v["id"],
+                                "vehicle_number": v["vehicle_number"],
+                                "owner_name":     v["owner_name"],
+                                "model":          v.get("model", ""),
+                                "color":          v.get("color", ""),
+                                "phone":          v.get("phone", ""),
+                                "flat":           v.get("flat", ""),
+                                "society":        v.get("society", "Villa Society"),
+                            }
+                            qr_img = make_qr_bytes(qr_payload)
+                            st.image(qr_img, caption="Scan to identify vehicle", width=200)
+                            st.download_button(
+                                "⬇️ Download QR",
+                                data=qr_img,
+                                file_name=f"qr_{v['vehicle_number'].replace(' ','_')}.png",
+                                mime="image/png",
+                                key=f"dl_qr_{v['id']}",
+                                use_container_width=True,
+                            )
+                        with c2:
+                            st.markdown(f"**Vehicle ID:** `{v['id']}`")
+                            st.markdown(f"**Number:** {v['vehicle_number']}")
+                            st.markdown(f"**Owner:** {v['owner_name']}")
+                            st.markdown(f"**Model:** {v.get('model','—')}")
+                            st.markdown(f"**Color:** {v.get('color','—')}")
+                            st.markdown(f"**Phone:** {v.get('phone','—')}")
+                            st.markdown(f"**Flat/Unit:** {v.get('flat','—')}")
+                            st.markdown(f"**Society:** {v.get('society','Villa Society')}")
+                            st.caption(f"Registered: {v['registered_at'][:16]}")
+                            if st.button("🗑️ Remove vehicle", key=f"rm_v_{v['id']}"):
+                                data["vehicles"] = [x for x in data["vehicles"] if x["id"] != v["id"]]
+                                save_data(data)
+                                st.success("Vehicle removed.")
+                                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 2 — Book a Slot
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_book:
+        st.subheader("Check Availability & Book")
+
+        if user == "Guest":
+            st.warning("Enter your name in the sidebar to book a parking slot.")
+        else:
+            vehicles = my_vehicles()
+            if not vehicles:
+                st.warning("You have no registered vehicles. Go to the **🚗 My Cars & QR** tab to register one first.")
+            else:
+                col_d, col_s, col_e = st.columns(3)
+                with col_d:
+                    park_date = st.date_input("Date", value=date.today(), min_value=date.today(), key="park_date")
+                with col_s:
+                    start_h = st.selectbox("Start time", [f"{h:02d}:00" for h in range(0, 24)], index=8, key="park_start")
+                with col_e:
+                    end_options  = [f"{h:02d}:00" for h in range(0, 24)]
+                    end_h = st.selectbox("End time", end_options, index=18, key="park_end")
+
+                if start_h >= end_h:
+                    st.error("End time must be after start time.")
+                else:
+                    date_str = str(park_date)
+                    occupied = get_occupied_slots(date_str, start_h, end_h)
+
+                    st.markdown("#### Slot Availability")
+                    cols = st.columns(TOTAL_SLOTS)
+                    for i, slot in enumerate(SLOT_NAMES):
+                        with cols[i]:
+                            # find who occupies it
+                            occupant_info = ""
+                            for pb in data["parking_bookings"]:
+                                if (pb["slot"] == slot and pb["date"] == date_str
+                                        and slots_overlap(start_h, end_h, pb["start_time"], pb["end_time"])):
+                                    occupant_info = pb.get("vehicle_number", pb.get("vehicle", ""))
+                                    break
+                            if slot in occupied:
+                                st.markdown(
+                                    f"<div style='background:#dc3545;color:white;border-radius:12px;"
+                                    f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
+                                    f"{slot}<br><small style='font-size:.6em'>🔴 Occupied</small>"
+                                    f"{'<br><small style=\"font-size:.55em\">' + occupant_info + '</small>' if occupant_info else ''}"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.markdown(
+                                    f"<div style='background:#28a745;color:white;border-radius:12px;"
+                                    f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
+                                    f"{slot}<br><small style='font-size:.6em'>🟢 Free</small></div>",
+                                    unsafe_allow_html=True,
+                                )
+
+                    st.write("")
+                    available_slots = [s for s in SLOT_NAMES if s not in occupied]
+
+                    if not available_slots:
+                        st.error("All slots are occupied for the selected time window.")
+                    else:
+                        st.markdown("#### Reserve a Slot")
+                        vehicle_labels = {
+                            v["id"]: f"{v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ({v.get('color','')})"
+                            for v in vehicles
+                        }
+                        with st.form("park_booking_form"):
+                            chosen_slot = st.selectbox("Select slot", available_slots)
+                            chosen_vid  = st.selectbox(
+                                "Select your vehicle (QR pass)",
+                                options=list(vehicle_labels.keys()),
+                                format_func=lambda k: vehicle_labels[k],
+                            )
+                            book_submit = st.form_submit_button("Confirm Booking", type="primary", use_container_width=True)
+
+                            if book_submit:
+                                still_occupied = get_occupied_slots(date_str, start_h, end_h)
+                                if chosen_slot in still_occupied:
+                                    st.error(f"Slot {chosen_slot} was just taken. Please choose another.")
+                                else:
+                                    chosen_vehicle = next(v for v in vehicles if v["id"] == chosen_vid)
+                                    new_id = f"PK{len(data['parking_bookings']) + 1:04d}"
+                                    booking_record = {
+                                        "id":             new_id,
+                                        "slot":           chosen_slot,
+                                        "user":           user,
+                                        "vehicle_id":     chosen_vehicle["id"],
+                                        "vehicle_number": chosen_vehicle["vehicle_number"],
+                                        "owner_name":     chosen_vehicle["owner_name"],
+                                        "model":          chosen_vehicle.get("model", ""),
+                                        "color":          chosen_vehicle.get("color", ""),
+                                        "phone":          chosen_vehicle.get("phone", ""),
+                                        "flat":           chosen_vehicle.get("flat", ""),
+                                        "date":           date_str,
+                                        "start_time":     start_h,
+                                        "end_time":       end_h,
+                                        "booked_at":      str(datetime.now()),
+                                        # legacy field kept for backwards compat
+                                        "vehicle":        chosen_vehicle["vehicle_number"],
+                                    }
+                                    data["parking_bookings"].append(booking_record)
+                                    save_data(data)
+                                    st.success(f"✅ Slot **{chosen_slot}** booked for **{chosen_vehicle['vehicle_number']}** on {date_str}  {start_h}–{end_h}!")
+                                    st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 3 — My Parking Bookings
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_mine:
+        st.subheader("My Parking Reservations")
+
+        my_bookings = [pb for pb in data["parking_bookings"] if pb["user"] == user]
+
+        if not my_bookings:
+            st.info("You have no parking bookings yet.")
+        else:
+            for pb in sorted(my_bookings, key=lambda x: (x["date"], x["start_time"]), reverse=True):
+                is_upcoming = pb["date"] >= str(date.today())
+                label_color = "🟢" if is_upcoming else "⚫"
+                with st.expander(
+                    f"{label_color} Slot **{pb['slot']}** — {pb['date']}  {pb['start_time']}–{pb['end_time']}  |  {pb.get('vehicle_number', pb.get('vehicle',''))}",
+                    expanded=is_upcoming,
+                ):
+                    left, right = st.columns([2, 1])
+                    with left:
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Slot", pb["slot"])
+                        c2.metric("Date", pb["date"])
+                        c3.metric("From", pb["start_time"])
+                        c4.metric("Until", pb["end_time"])
+                        st.markdown(f"**Vehicle:** {pb.get('vehicle_number', pb.get('vehicle','—'))}")
+                        st.markdown(f"**Owner:** {pb.get('owner_name', user)}")
+                        st.markdown(f"**Model:** {pb.get('model','—')}  ·  **Color:** {pb.get('color','—')}")
+                        st.markdown(f"**Phone:** {pb.get('phone','—')}  ·  **Flat:** {pb.get('flat','—')}")
+                        st.caption(f"Booking ID: `{pb['id']}`  |  Booked: {pb['booked_at'][:16]}")
+                        if st.button("❌ Cancel Booking", key=f"cancel_park_{pb['id']}"):
+                            data["parking_bookings"] = [x for x in data["parking_bookings"] if x["id"] != pb["id"]]
+                            save_data(data)
+                            st.success("Booking cancelled.")
+                            st.rerun()
+                    with right:
+                        # Booking QR — contains full slot + owner info
+                        booking_qr_payload = {
+                            "type":           "parking_booking",
+                            "booking_id":     pb["id"],
+                            "slot":           pb["slot"],
+                            "vehicle_number": pb.get("vehicle_number", pb.get("vehicle", "")),
+                            "owner_name":     pb.get("owner_name", user),
+                            "model":          pb.get("model", ""),
+                            "color":          pb.get("color", ""),
+                            "phone":          pb.get("phone", ""),
+                            "flat":           pb.get("flat", ""),
+                            "date":           pb["date"],
+                            "start_time":     pb["start_time"],
+                            "end_time":       pb["end_time"],
+                            "society":        "Villa Society",
+                        }
+                        bqr = make_qr_bytes(booking_qr_payload)
+                        st.image(bqr, caption="Booking QR", width=160)
+                        st.download_button(
+                            "⬇️ Download",
+                            data=bqr,
+                            file_name=f"booking_{pb['id']}.png",
+                            mime="image/png",
+                            key=f"dl_bqr_{pb['id']}",
+                            use_container_width=True,
+                        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 4 — All Bookings overview
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_all:
+        st.subheader("All Parking Reservations")
+
+        all_pb = data["parking_bookings"]
+        if not all_pb:
+            st.info("No parking bookings have been made yet.")
+        else:
+            rows = [
+                {
+                    "ID":           pb["id"],
+                    "Slot":         pb["slot"],
+                    "User":         pb["user"],
+                    "Vehicle":      pb.get("vehicle_number", pb.get("vehicle", "")),
+                    "Owner":        pb.get("owner_name", pb["user"]),
+                    "Model":        pb.get("model", ""),
+                    "Color":        pb.get("color", ""),
+                    "Flat":         pb.get("flat", ""),
+                    "Date":         pb["date"],
+                    "Start":        pb["start_time"],
+                    "End":          pb["end_time"],
+                    "Booked At":    pb["booked_at"][:16],
+                }
+                for pb in sorted(all_pb, key=lambda x: (x["date"], x["slot"]))
+            ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)

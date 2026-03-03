@@ -1,0 +1,32 @@
+{
+  "rides": [
+    {
+      "id": "R0001",
+      "driver": "Nandhini",
+      "from": "Earthen Ambience by Evantha Sri Durga, Thyvakanahally, Bengaluru, Karnataka, India",
+      "to": "Guidewire Software India, Kodbisanhalli, Bengaluru, Karnataka, India",
+      "date": "2026-03-02",
+      "time": "09:00:00",
+      "seats": 2,
+      "price_per_seat": 10.0,
+      "car_model": "Commet",
+      "notes": "",
+      "posted_at": "2026-03-02 07:34:34.767873"
+    }
+  ],
+  "bookings": [],
+  "insurance": {
+    "Nandhini": {
+      "provider": "MEdical",
+      "policy_number": "POL-123456789",
+      "policy_type": "Third Party",
+      "covers_passengers": true,
+      "vehicle_reg": "AB12 CDE",
+      "expiry_date": "2027-03-02",
+      "insurer_contact": "080012345678",
+      "saved_at": "2026-03-02 07:34:05.127699"
+    }
+  },
+  "parking_bookings": [],
+  "vehicles": []
+}

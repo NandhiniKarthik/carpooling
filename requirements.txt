@@ -4,3 +4,5 @@ googlemaps==4.10.0
 folium==0.20.0
 streamlit-folium==0.26.2
 streamlit-searchbox==0.1.24
+qrcode[pil]>=7.4
+Pillow>=10.0

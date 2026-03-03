@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 import io
+import hashlib
 from datetime import datetime, date, time
 from pathlib import Path
 import googlemaps
@@ -18,8 +19,11 @@ DATA_FILE = Path(__file__).parent / "data.json"
 def load_data() -> dict:
     if DATA_FILE.exists():
         with open(DATA_FILE) as f:
-            return json.load(f)
-    return {"rides": [], "bookings": [], "insurance": {}, "passenger_ids": {}, "medical_info": {}, "parking_bookings": [], "vehicles": []}
+            d = json.load(f)
+        if "users" not in d:
+            d["users"] = {}
+        return d
+    return {"rides": [], "bookings": [], "insurance": {}, "passenger_ids": {}, "medical_info": {}, "parking_bookings": [], "vehicles": [], "users": {}}
 
 def save_data(data: dict):
     with open(DATA_FILE, "w") as f:
@@ -139,6 +143,45 @@ def has_valid_id(user: str, data: dict) -> tuple:
         return False, "Invalid expiry date"
     return True, id_proof.get("id_type", "ID verified")
 
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def seed_admin(data: dict):
+    """Create a default admin account if none exists."""
+    if not any(u.get("role") == "admin" for u in data["users"].values()):
+        data["users"]["admin"] = {
+            "password_hash": hash_password("admin123"),
+            "role": "admin",
+            "society": "Earthen Ambience",
+            "created_at": str(datetime.now()),
+        }
+        save_data(data)
+
+def authenticate(username: str, password: str, data: dict):
+    """Return user dict on success, None on failure."""
+    user = data["users"].get(username)
+    if user and user["password_hash"] == hash_password(password):
+        return user
+    return None
+
+def register_user(username: str, password: str, role: str, society: str, data: dict) -> tuple:
+    """Register a new user. Returns (ok: bool, message: str)."""
+    if not username or not password:
+        return False, "Username and password are required."
+    if username in data["users"]:
+        return False, "Username already exists."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    data["users"][username] = {
+        "password_hash": hash_password(password),
+        "role": role,
+        "society": society,
+        "created_at": str(datetime.now()),
+    }
+    save_data(data)
+    return True, "Account created successfully!"
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CarpoolConnect",
@@ -200,35 +243,125 @@ if "emergency_active" not in st.session_state:
     st.session_state.emergency_active = False
 if "emergency_location" not in st.session_state:
     st.session_state.emergency_location = ""
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "user_role" not in st.session_state:
+    st.session_state.user_role = "passenger"
+if "user_society" not in st.session_state:
+    st.session_state.user_society = ""
 
 data = load_data()
+seed_admin(data)
+
+# ── Login / Register gate ─────────────────────────────────────────────────────
+if not st.session_state.logged_in:
+    st.markdown("""
+    <style>
+        .login-box { max-width: 480px; margin: 60px auto; }
+        .login-title { font-size: 2.2rem; font-weight: 800; color: #667eea; text-align: center; margin-bottom: 0.2rem; }
+        .login-sub   { text-align: center; color: #555; margin-bottom: 1.5rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        st.markdown('<div class="login-title">🚗 CarpoolConnect</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-sub">Save money · Reduce traffic · Travel together</div>', unsafe_allow_html=True)
+        st.write("")
+
+        login_tab, register_tab = st.tabs(["🔑 Login", "📝 Register"])
+
+        # ── Login tab ──────────────────────────────────────────────────────────
+        with login_tab:
+            with st.form("login_form"):
+                l_user = st.text_input("Username", placeholder="Enter your username")
+                l_pass = st.text_input("Password", type="password", placeholder="Enter your password")
+                l_submit = st.form_submit_button("Login", type="primary", use_container_width=True)
+
+                if l_submit:
+                    if not l_user or not l_pass:
+                        st.error("Please enter both username and password.")
+                    else:
+                        auth = authenticate(l_user, l_pass, data)
+                        if auth:
+                            st.session_state.logged_in = True
+                            st.session_state.current_user = l_user
+                            st.session_state.user_role = auth["role"]
+                            st.session_state.user_society = auth.get("society", "")
+                            st.session_state.page = "Home"
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password.")
+
+            st.caption("Default admin credentials: `admin` / `admin123`")
+
+        # ── Register tab ────────────────────────────────────────────────────────
+        with register_tab:
+            with st.form("register_form"):
+                r_user = st.text_input("Choose a username *", placeholder="e.g. john_doe")
+                r_pass = st.text_input("Password * (min 6 chars)", type="password")
+                r_pass2 = st.text_input("Confirm Password *", type="password")
+                r_role = st.selectbox(
+                    "I am a… *",
+                    ["passenger", "driver"],
+                    format_func=lambda x: "🧳 Passenger — I want to book rides" if x == "passenger" else "🚗 Driver — I have a car and want to offer rides",
+                )
+                r_society = st.selectbox(
+                    "Society membership",
+                    ["", "Earthen Ambience"],
+                    format_func=lambda x: "Not a society member" if x == "" else f"🏘️ {x}",
+                )
+                r_submit = st.form_submit_button("Create Account", type="primary", use_container_width=True)
+
+                if r_submit:
+                    if r_pass != r_pass2:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, msg = register_user(r_user, r_pass, r_role, r_society, data)
+                        if ok:
+                            st.success(msg + " Please log in.")
+                        else:
+                            st.error(msg)
+
+    st.stop()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🚗 CarpoolConnect")
     st.divider()
 
-    username = st.text_input("Your name", value=st.session_state.current_user, placeholder="Enter your name")
-    if username:
-        st.session_state.current_user = username
+    # User info
+    role_icon = {"admin": "🛡️", "driver": "🚗", "passenger": "🧳"}.get(st.session_state.user_role, "👤")
+    st.markdown(f"**{role_icon} {st.session_state.current_user}**")
+    st.caption(f"Role: {st.session_state.user_role.capitalize()}")
+    if st.session_state.user_society:
+        st.caption(f"🏘️ {st.session_state.user_society}")
 
     st.divider()
     st.subheader("Navigation")
-    pages = ["🏠 Home", "🔍 Find a Ride", "➕ Offer a Ride", "📋 My Bookings", "📊 Dashboard", "👤 My Profile", "🅿️ Villa Parking"]
+
+    # Build page list based on role and society
+    pages = ["🏠 Home", "🔍 Find a Ride"]
+    if st.session_state.user_role in ("driver", "admin"):
+        pages.append("➕ Offer a Ride")
+    pages += ["📋 My Bookings", "📊 Dashboard", "👤 My Profile"]
+    if st.session_state.user_society == "Earthen Ambience" or st.session_state.user_role == "admin":
+        pages.append("🅿️ Villa Parking")
+    if st.session_state.user_role == "admin":
+        pages.append("🔧 Admin Panel")
+
     for p in pages:
         if st.button(p, use_container_width=True):
             st.session_state.page = p.split(" ", 1)[1]
 
     st.divider()
     user = st.session_state.current_user
-    if user != "Guest":
-        ins_ok, _ = has_valid_insurance(user, data)
-        id_ok,  _ = has_valid_id(user, data)
-        st.caption(f"Logged in as: **{user}**")
+    ins_ok, _ = has_valid_insurance(user, data)
+    id_ok,  _ = has_valid_id(user, data)
+    if st.session_state.user_role == "driver":
         st.caption("🛡️ Insurance: " + ("✅ Valid" if ins_ok else "❌ Not set"))
+    if st.session_state.user_role == "passenger":
         st.caption("🪪 ID Proof: "  + ("✅ Valid" if id_ok  else "❌ Not set"))
-    else:
-        st.caption(f"Logged in as: **{user}**")
 
     st.divider()
     if st.session_state.emergency_active:
@@ -242,6 +375,13 @@ with st.sidebar:
             st.session_state.emergency_active = True
             st.session_state.page = "Emergency"
             st.rerun()
+
+    st.divider()
+    if st.button("🚪 Logout", use_container_width=True):
+        for key in ["logged_in", "current_user", "user_role", "user_society", "page",
+                    "emergency_active", "emergency_location"]:
+            st.session_state.pop(key, None)
+        st.rerun()
 
 page = st.session_state.page
 
@@ -381,9 +521,7 @@ elif page == "Find a Ride":
                         key=f"seats_{ride['id']}"
                     )
                     if st.button("Book", key=f"book_{ride['id']}", type="primary"):
-                        if st.session_state.current_user == "Guest":
-                            st.error("Please enter your name in the sidebar first.")
-                        elif ride["driver"] == st.session_state.current_user:
+                        if ride["driver"] == st.session_state.current_user:
                             st.error("You cannot book your own ride.")
                         else:
                             id_ok, id_msg = has_valid_id(st.session_state.current_user, data)
@@ -415,6 +553,10 @@ elif page == "Find a Ride":
 elif page == "Offer a Ride":
     st.title("➕ Offer a Ride")
     st.markdown("Share your journey and help others travel affordably.")
+
+    if st.session_state.user_role not in ("driver", "admin"):
+        st.error("Only registered **drivers** can offer rides. If you have a car, please create a Driver account.")
+        st.stop()
 
     if st.session_state.current_user != "Guest":
         ins_ok, ins_msg = has_valid_insurance(st.session_state.current_user, data)
@@ -456,8 +598,6 @@ elif page == "Offer a Ride":
     if st.button("Post Ride", type="primary", use_container_width=True):
         if not origin or not destination:
             st.error("Please fill in all required fields (*).")
-        elif st.session_state.current_user == "Guest":
-            st.error("Please enter your name in the sidebar before posting a ride.")
         else:
             ride = {
                 "id": f"R{len(data['rides'])+1:04d}",
@@ -485,9 +625,7 @@ elif page == "My Bookings":
     st.title("📋 My Bookings")
 
     user = st.session_state.current_user
-    if user == "Guest":
-        st.warning("Please enter your name in the sidebar to view your bookings.")
-    else:
+    if True:
         # Rides I'm driving
         my_rides = [r for r in data["rides"] if r["driver"] == user]
         # Rides I've booked as passenger
@@ -540,10 +678,6 @@ elif page == "My Bookings":
 # ── MY PROFILE ────────────────────────────────────────────────────────────────
 elif page == "My Profile":
     st.title("👤 My Profile")
-
-    if st.session_state.current_user == "Guest":
-        st.warning("Please enter your name in the sidebar first.")
-        st.stop()
 
     user = st.session_state.current_user
     tab1, tab2, tab3 = st.tabs(["🛡️ Driver Insurance", "🪪 Passenger ID Proof", "🚨 Medical & Emergency"])
@@ -1032,94 +1166,90 @@ elif page == "Villa Parking":
     with tab_cars:
         st.subheader("Register your vehicle & get a QR pass")
 
-        if user == "Guest":
-            st.warning("Enter your name in the sidebar to manage vehicles.")
+        # ── Register form ─────────────────────────────────────────────
+        with st.expander("➕ Register a new vehicle", expanded=len(my_vehicles()) == 0):
+            with st.form("register_vehicle_form"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    v_owner_name = st.text_input("Owner full name", placeholder="Alice Johnson")
+                    v_number     = st.text_input("Vehicle number *", placeholder="AB12 CDE")
+                    v_model      = st.text_input("Car model", placeholder="Toyota Prius")
+                with col_b:
+                    v_color   = st.text_input("Color", placeholder="White")
+                    v_phone   = st.text_input("Contact phone", placeholder="07700 900123")
+                    v_flat    = st.text_input("Flat / unit no.", placeholder="Villa 4B")
+                reg_submit = st.form_submit_button("Register & Generate QR", type="primary", use_container_width=True)
+
+                if reg_submit:
+                    if not v_number.strip():
+                        st.error("Vehicle number is required.")
+                    elif any(v["vehicle_number"] == v_number.strip().upper() and v["owner"] == user
+                             for v in data["vehicles"]):
+                        st.warning("This vehicle is already registered under your name.")
+                    else:
+                        vid = f"VH{len(data['vehicles']) + 1:04d}"
+                        data["vehicles"].append({
+                            "id":             vid,
+                            "owner":          user,
+                            "owner_name":     v_owner_name.strip() or user,
+                            "vehicle_number": v_number.strip().upper(),
+                            "model":          v_model.strip(),
+                            "color":          v_color.strip(),
+                            "phone":          v_phone.strip(),
+                            "flat":           v_flat.strip(),
+                            "registered_at":  str(datetime.now()),
+                            "society":        "Villa Society",
+                        })
+                        save_data(data)
+                        st.success(f"Vehicle **{v_number.strip().upper()}** registered! Your QR pass is below.")
+                        st.rerun()
+
+        # ── Registered vehicles & QR codes ────────────────────────────
+        vehicles = my_vehicles()
+        if not vehicles:
+            st.info("No vehicles registered yet. Use the form above.")
         else:
-            # ── Register form ─────────────────────────────────────────────
-            with st.expander("➕ Register a new vehicle", expanded=len(my_vehicles()) == 0):
-                with st.form("register_vehicle_form"):
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        v_owner_name = st.text_input("Owner full name", placeholder="Alice Johnson")
-                        v_number     = st.text_input("Vehicle number *", placeholder="AB12 CDE")
-                        v_model      = st.text_input("Car model", placeholder="Toyota Prius")
-                    with col_b:
-                        v_color   = st.text_input("Color", placeholder="White")
-                        v_phone   = st.text_input("Contact phone", placeholder="07700 900123")
-                        v_flat    = st.text_input("Flat / unit no.", placeholder="Villa 4B")
-                    reg_submit = st.form_submit_button("Register & Generate QR", type="primary", use_container_width=True)
-
-                    if reg_submit:
-                        if not v_number.strip():
-                            st.error("Vehicle number is required.")
-                        elif any(v["vehicle_number"] == v_number.strip().upper() and v["owner"] == user
-                                 for v in data["vehicles"]):
-                            st.warning("This vehicle is already registered under your name.")
-                        else:
-                            vid = f"VH{len(data['vehicles']) + 1:04d}"
-                            data["vehicles"].append({
-                                "id":             vid,
-                                "owner":          user,
-                                "owner_name":     v_owner_name.strip() or user,
-                                "vehicle_number": v_number.strip().upper(),
-                                "model":          v_model.strip(),
-                                "color":          v_color.strip(),
-                                "phone":          v_phone.strip(),
-                                "flat":           v_flat.strip(),
-                                "registered_at":  str(datetime.now()),
-                                "society":        "Villa Society",
-                            })
+            st.markdown(f"**{len(vehicles)} vehicle(s) registered**")
+            for v in vehicles:
+                with st.expander(f"🚗 {v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ·  {v.get('color','') or ''}"):
+                    c1, c2 = st.columns([1, 2])
+                    with c1:
+                        qr_payload = {
+                            "type":           "vehicle_pass",
+                            "vehicle_id":     v["id"],
+                            "vehicle_number": v["vehicle_number"],
+                            "owner_name":     v["owner_name"],
+                            "model":          v.get("model", ""),
+                            "color":          v.get("color", ""),
+                            "phone":          v.get("phone", ""),
+                            "flat":           v.get("flat", ""),
+                            "society":        v.get("society", "Villa Society"),
+                        }
+                        qr_img = make_qr_bytes(qr_payload)
+                        st.image(qr_img, caption="Scan to identify vehicle", width=200)
+                        st.download_button(
+                            "⬇️ Download QR",
+                            data=qr_img,
+                            file_name=f"qr_{v['vehicle_number'].replace(' ','_')}.png",
+                            mime="image/png",
+                            key=f"dl_qr_{v['id']}",
+                            use_container_width=True,
+                        )
+                    with c2:
+                        st.markdown(f"**Vehicle ID:** `{v['id']}`")
+                        st.markdown(f"**Number:** {v['vehicle_number']}")
+                        st.markdown(f"**Owner:** {v['owner_name']}")
+                        st.markdown(f"**Model:** {v.get('model','—')}")
+                        st.markdown(f"**Color:** {v.get('color','—')}")
+                        st.markdown(f"**Phone:** {v.get('phone','—')}")
+                        st.markdown(f"**Flat/Unit:** {v.get('flat','—')}")
+                        st.markdown(f"**Society:** {v.get('society','Villa Society')}")
+                        st.caption(f"Registered: {v['registered_at'][:16]}")
+                        if st.button("🗑️ Remove vehicle", key=f"rm_v_{v['id']}"):
+                            data["vehicles"] = [x for x in data["vehicles"] if x["id"] != v["id"]]
                             save_data(data)
-                            st.success(f"Vehicle **{v_number.strip().upper()}** registered! Your QR pass is below.")
+                            st.success("Vehicle removed.")
                             st.rerun()
-
-            # ── Registered vehicles & QR codes ────────────────────────────
-            vehicles = my_vehicles()
-            if not vehicles:
-                st.info("No vehicles registered yet. Use the form above.")
-            else:
-                st.markdown(f"**{len(vehicles)} vehicle(s) registered**")
-                for v in vehicles:
-                    with st.expander(f"🚗 {v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ·  {v.get('color','') or ''}"):
-                        c1, c2 = st.columns([1, 2])
-                        with c1:
-                            # Build QR payload
-                            qr_payload = {
-                                "type":           "vehicle_pass",
-                                "vehicle_id":     v["id"],
-                                "vehicle_number": v["vehicle_number"],
-                                "owner_name":     v["owner_name"],
-                                "model":          v.get("model", ""),
-                                "color":          v.get("color", ""),
-                                "phone":          v.get("phone", ""),
-                                "flat":           v.get("flat", ""),
-                                "society":        v.get("society", "Villa Society"),
-                            }
-                            qr_img = make_qr_bytes(qr_payload)
-                            st.image(qr_img, caption="Scan to identify vehicle", width=200)
-                            st.download_button(
-                                "⬇️ Download QR",
-                                data=qr_img,
-                                file_name=f"qr_{v['vehicle_number'].replace(' ','_')}.png",
-                                mime="image/png",
-                                key=f"dl_qr_{v['id']}",
-                                use_container_width=True,
-                            )
-                        with c2:
-                            st.markdown(f"**Vehicle ID:** `{v['id']}`")
-                            st.markdown(f"**Number:** {v['vehicle_number']}")
-                            st.markdown(f"**Owner:** {v['owner_name']}")
-                            st.markdown(f"**Model:** {v.get('model','—')}")
-                            st.markdown(f"**Color:** {v.get('color','—')}")
-                            st.markdown(f"**Phone:** {v.get('phone','—')}")
-                            st.markdown(f"**Flat/Unit:** {v.get('flat','—')}")
-                            st.markdown(f"**Society:** {v.get('society','Villa Society')}")
-                            st.caption(f"Registered: {v['registered_at'][:16]}")
-                            if st.button("🗑️ Remove vehicle", key=f"rm_v_{v['id']}"):
-                                data["vehicles"] = [x for x in data["vehicles"] if x["id"] != v["id"]]
-                                save_data(data)
-                                st.success("Vehicle removed.")
-                                st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Tab 2 — Book a Slot
@@ -1127,105 +1257,100 @@ elif page == "Villa Parking":
     with tab_book:
         st.subheader("Check Availability & Book")
 
-        if user == "Guest":
-            st.warning("Enter your name in the sidebar to book a parking slot.")
+        vehicles = my_vehicles()
+        if not vehicles:
+            st.warning("You have no registered vehicles. Go to the **🚗 My Cars & QR** tab to register one first.")
         else:
-            vehicles = my_vehicles()
-            if not vehicles:
-                st.warning("You have no registered vehicles. Go to the **🚗 My Cars & QR** tab to register one first.")
+            col_d, col_s, col_e = st.columns(3)
+            with col_d:
+                park_date = st.date_input("Date", value=date.today(), min_value=date.today(), key="park_date")
+            with col_s:
+                start_h = st.selectbox("Start time", [f"{h:02d}:00" for h in range(0, 24)], index=8, key="park_start")
+            with col_e:
+                end_options  = [f"{h:02d}:00" for h in range(0, 24)]
+                end_h = st.selectbox("End time", end_options, index=18, key="park_end")
+
+            if start_h >= end_h:
+                st.error("End time must be after start time.")
             else:
-                col_d, col_s, col_e = st.columns(3)
-                with col_d:
-                    park_date = st.date_input("Date", value=date.today(), min_value=date.today(), key="park_date")
-                with col_s:
-                    start_h = st.selectbox("Start time", [f"{h:02d}:00" for h in range(0, 24)], index=8, key="park_start")
-                with col_e:
-                    end_options  = [f"{h:02d}:00" for h in range(0, 24)]
-                    end_h = st.selectbox("End time", end_options, index=18, key="park_end")
+                date_str = str(park_date)
+                occupied = get_occupied_slots(date_str, start_h, end_h)
 
-                if start_h >= end_h:
-                    st.error("End time must be after start time.")
-                else:
-                    date_str = str(park_date)
-                    occupied = get_occupied_slots(date_str, start_h, end_h)
-
-                    st.markdown("#### Slot Availability")
-                    cols = st.columns(TOTAL_SLOTS)
-                    for i, slot in enumerate(SLOT_NAMES):
-                        with cols[i]:
-                            # find who occupies it
-                            occupant_info = ""
-                            for pb in data["parking_bookings"]:
-                                if (pb["slot"] == slot and pb["date"] == date_str
-                                        and slots_overlap(start_h, end_h, pb["start_time"], pb["end_time"])):
-                                    occupant_info = pb.get("vehicle_number", pb.get("vehicle", ""))
-                                    break
-                            if slot in occupied:
-                                st.markdown(
-                                    f"<div style='background:#dc3545;color:white;border-radius:12px;"
-                                    f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
-                                    f"{slot}<br><small style='font-size:.6em'>🔴 Occupied</small>"
-                                    f"{'<br><small style=\"font-size:.55em\">' + occupant_info + '</small>' if occupant_info else ''}"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.markdown(
-                                    f"<div style='background:#28a745;color:white;border-radius:12px;"
-                                    f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
-                                    f"{slot}<br><small style='font-size:.6em'>🟢 Free</small></div>",
-                                    unsafe_allow_html=True,
-                                )
-
-                    st.write("")
-                    available_slots = [s for s in SLOT_NAMES if s not in occupied]
-
-                    if not available_slots:
-                        st.error("All slots are occupied for the selected time window.")
-                    else:
-                        st.markdown("#### Reserve a Slot")
-                        vehicle_labels = {
-                            v["id"]: f"{v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ({v.get('color','')})"
-                            for v in vehicles
-                        }
-                        with st.form("park_booking_form"):
-                            chosen_slot = st.selectbox("Select slot", available_slots)
-                            chosen_vid  = st.selectbox(
-                                "Select your vehicle (QR pass)",
-                                options=list(vehicle_labels.keys()),
-                                format_func=lambda k: vehicle_labels[k],
+                st.markdown("#### Slot Availability")
+                cols = st.columns(TOTAL_SLOTS)
+                for i, slot in enumerate(SLOT_NAMES):
+                    with cols[i]:
+                        occupant_info = ""
+                        for pb in data["parking_bookings"]:
+                            if (pb["slot"] == slot and pb["date"] == date_str
+                                    and slots_overlap(start_h, end_h, pb["start_time"], pb["end_time"])):
+                                occupant_info = pb.get("vehicle_number", pb.get("vehicle", ""))
+                                break
+                        if slot in occupied:
+                            st.markdown(
+                                f"<div style='background:#dc3545;color:white;border-radius:12px;"
+                                f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
+                                f"{slot}<br><small style='font-size:.6em'>🔴 Occupied</small>"
+                                f"{'<br><small style=\"font-size:.55em\">' + occupant_info + '</small>' if occupant_info else ''}"
+                                f"</div>",
+                                unsafe_allow_html=True,
                             )
-                            book_submit = st.form_submit_button("Confirm Booking", type="primary", use_container_width=True)
+                        else:
+                            st.markdown(
+                                f"<div style='background:#28a745;color:white;border-radius:12px;"
+                                f"padding:16px 4px;text-align:center;font-size:1.3em;font-weight:bold;'>"
+                                f"{slot}<br><small style='font-size:.6em'>🟢 Free</small></div>",
+                                unsafe_allow_html=True,
+                            )
 
-                            if book_submit:
-                                still_occupied = get_occupied_slots(date_str, start_h, end_h)
-                                if chosen_slot in still_occupied:
-                                    st.error(f"Slot {chosen_slot} was just taken. Please choose another.")
-                                else:
-                                    chosen_vehicle = next(v for v in vehicles if v["id"] == chosen_vid)
-                                    new_id = f"PK{len(data['parking_bookings']) + 1:04d}"
-                                    booking_record = {
-                                        "id":             new_id,
-                                        "slot":           chosen_slot,
-                                        "user":           user,
-                                        "vehicle_id":     chosen_vehicle["id"],
-                                        "vehicle_number": chosen_vehicle["vehicle_number"],
-                                        "owner_name":     chosen_vehicle["owner_name"],
-                                        "model":          chosen_vehicle.get("model", ""),
-                                        "color":          chosen_vehicle.get("color", ""),
-                                        "phone":          chosen_vehicle.get("phone", ""),
-                                        "flat":           chosen_vehicle.get("flat", ""),
-                                        "date":           date_str,
-                                        "start_time":     start_h,
-                                        "end_time":       end_h,
-                                        "booked_at":      str(datetime.now()),
-                                        # legacy field kept for backwards compat
-                                        "vehicle":        chosen_vehicle["vehicle_number"],
-                                    }
-                                    data["parking_bookings"].append(booking_record)
-                                    save_data(data)
-                                    st.success(f"✅ Slot **{chosen_slot}** booked for **{chosen_vehicle['vehicle_number']}** on {date_str}  {start_h}–{end_h}!")
-                                    st.rerun()
+                st.write("")
+                available_slots = [s for s in SLOT_NAMES if s not in occupied]
+
+                if not available_slots:
+                    st.error("All slots are occupied for the selected time window.")
+                else:
+                    st.markdown("#### Reserve a Slot")
+                    vehicle_labels = {
+                        v["id"]: f"{v['vehicle_number']}  ·  {v.get('model','') or 'Car'}  ({v.get('color','')})"
+                        for v in vehicles
+                    }
+                    with st.form("park_booking_form"):
+                        chosen_slot = st.selectbox("Select slot", available_slots)
+                        chosen_vid  = st.selectbox(
+                            "Select your vehicle (QR pass)",
+                            options=list(vehicle_labels.keys()),
+                            format_func=lambda k: vehicle_labels[k],
+                        )
+                        book_submit = st.form_submit_button("Confirm Booking", type="primary", use_container_width=True)
+
+                        if book_submit:
+                            still_occupied = get_occupied_slots(date_str, start_h, end_h)
+                            if chosen_slot in still_occupied:
+                                st.error(f"Slot {chosen_slot} was just taken. Please choose another.")
+                            else:
+                                chosen_vehicle = next(v for v in vehicles if v["id"] == chosen_vid)
+                                new_id = f"PK{len(data['parking_bookings']) + 1:04d}"
+                                booking_record = {
+                                    "id":             new_id,
+                                    "slot":           chosen_slot,
+                                    "user":           user,
+                                    "vehicle_id":     chosen_vehicle["id"],
+                                    "vehicle_number": chosen_vehicle["vehicle_number"],
+                                    "owner_name":     chosen_vehicle["owner_name"],
+                                    "model":          chosen_vehicle.get("model", ""),
+                                    "color":          chosen_vehicle.get("color", ""),
+                                    "phone":          chosen_vehicle.get("phone", ""),
+                                    "flat":           chosen_vehicle.get("flat", ""),
+                                    "date":           date_str,
+                                    "start_time":     start_h,
+                                    "end_time":       end_h,
+                                    "booked_at":      str(datetime.now()),
+                                    "vehicle":        chosen_vehicle["vehicle_number"],
+                                }
+                                data["parking_bookings"].append(booking_record)
+                                save_data(data)
+                                st.success(f"✅ Slot **{chosen_slot}** booked for **{chosen_vehicle['vehicle_number']}** on {date_str}  {start_h}–{end_h}!")
+                                st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Tab 3 — My Parking Bookings
@@ -1318,3 +1443,136 @@ elif page == "Villa Parking":
                 for pb in sorted(all_pb, key=lambda x: (x["date"], x["slot"]))
             ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+# ── ADMIN PANEL ───────────────────────────────────────────────────────────────
+elif page == "Admin Panel":
+    if st.session_state.user_role != "admin":
+        st.error("Access denied. Admins only.")
+        st.stop()
+
+    st.title("🔧 Admin Panel")
+    st.caption("Full platform management — only visible to admins.")
+
+    admin_tab1, admin_tab2, admin_tab3, admin_tab4 = st.tabs(
+        ["👥 Users", "🚗 Rides", "🎫 Bookings", "🅿️ Parking"]
+    )
+
+    # ── Users tab ─────────────────────────────────────────────────────────────
+    with admin_tab1:
+        st.subheader("Registered Users")
+        users_data = data.get("users", {})
+        if not users_data:
+            st.info("No users registered yet.")
+        else:
+            user_rows = [
+                {
+                    "Username": uname,
+                    "Role": uinfo.get("role", "—"),
+                    "Society": uinfo.get("society", "—") or "None",
+                    "Created": uinfo.get("created_at", "—")[:16],
+                }
+                for uname, uinfo in users_data.items()
+            ]
+            st.dataframe(pd.DataFrame(user_rows), use_container_width=True)
+
+            st.divider()
+            st.subheader("Delete a User")
+            del_user_options = [u for u in users_data if u != st.session_state.current_user]
+            if del_user_options:
+                del_user = st.selectbox("Select user to delete", del_user_options)
+                if st.button("Delete User", type="primary"):
+                    del data["users"][del_user]
+                    save_data(data)
+                    st.success(f"User **{del_user}** deleted.")
+                    st.rerun()
+            else:
+                st.info("No other users to delete.")
+
+    # ── Rides tab ─────────────────────────────────────────────────────────────
+    with admin_tab2:
+        st.subheader("All Rides")
+        if not data["rides"]:
+            st.info("No rides posted yet.")
+        else:
+            ride_rows = [
+                {
+                    "ID":      r["id"],
+                    "Driver":  r["driver"],
+                    "From":    r["from"],
+                    "To":      r["to"],
+                    "Date":    r["date"],
+                    "Time":    r["time"],
+                    "Seats":   r["seats"],
+                    "Price":   f"£{r['price_per_seat']}",
+                }
+                for r in data["rides"]
+            ]
+            st.dataframe(pd.DataFrame(ride_rows), use_container_width=True)
+
+            st.divider()
+            del_ride_id = st.selectbox("Select ride to delete", [r["id"] for r in data["rides"]])
+            if st.button("Delete Ride", type="primary", key="del_ride"):
+                data["rides"] = [r for r in data["rides"] if r["id"] != del_ride_id]
+                data["bookings"] = [b for b in data["bookings"] if b["ride_id"] != del_ride_id]
+                save_data(data)
+                st.success(f"Ride **{del_ride_id}** and its bookings deleted.")
+                st.rerun()
+
+    # ── Bookings tab ──────────────────────────────────────────────────────────
+    with admin_tab3:
+        st.subheader("All Bookings")
+        if not data["bookings"]:
+            st.info("No bookings yet.")
+        else:
+            booking_rows = [
+                {
+                    "ID":        b["id"],
+                    "Ride":      b["ride_id"],
+                    "Passenger": b["passenger"],
+                    "From":      b["from"],
+                    "To":        b["to"],
+                    "Date":      b["date"],
+                    "Seats":     b["seats"],
+                    "Price":     f"£{b['price']:.2f}",
+                    "Booked":    b["booked_at"][:16],
+                }
+                for b in data["bookings"]
+            ]
+            st.dataframe(pd.DataFrame(booking_rows), use_container_width=True)
+
+            st.divider()
+            del_booking_id = st.selectbox("Select booking to delete", [b["id"] for b in data["bookings"]])
+            if st.button("Delete Booking", type="primary", key="del_booking"):
+                data["bookings"] = [b for b in data["bookings"] if b["id"] != del_booking_id]
+                save_data(data)
+                st.success(f"Booking **{del_booking_id}** deleted.")
+                st.rerun()
+
+    # ── Parking tab ───────────────────────────────────────────────────────────
+    with admin_tab4:
+        st.subheader("All Parking Bookings")
+        all_pk = data.get("parking_bookings", [])
+        if not all_pk:
+            st.info("No parking bookings yet.")
+        else:
+            pk_rows = [
+                {
+                    "ID":      pb["id"],
+                    "Slot":    pb["slot"],
+                    "User":    pb["user"],
+                    "Vehicle": pb.get("vehicle_number", ""),
+                    "Date":    pb["date"],
+                    "Start":   pb["start_time"],
+                    "End":     pb["end_time"],
+                }
+                for pb in sorted(all_pk, key=lambda x: (x["date"], x["slot"]))
+            ]
+            st.dataframe(pd.DataFrame(pk_rows), use_container_width=True)
+
+            st.divider()
+            del_pk_id = st.selectbox("Select parking booking to delete", [pb["id"] for pb in all_pk])
+            if st.button("Delete Parking Booking", type="primary", key="del_pk"):
+                data["parking_bookings"] = [pb for pb in all_pk if pb["id"] != del_pk_id]
+                save_data(data)
+                st.success(f"Parking booking **{del_pk_id}** deleted.")
+                st.rerun()
